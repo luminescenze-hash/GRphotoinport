@@ -228,16 +228,18 @@ enum MediaScanner {
                     || rawKey.contains("creationdate") || rawKey.contains("creation_date")
                 guard matched else { continue }
 
-                if let date = item.dateValue {
+                let loadedDate: Date? = try? await item.load(.dateValue)
+                if let date = loadedDate {
                     return localWallClock(date)
                 }
-                if let raw = item.stringValue, let date = parseQuickTimeDate(raw) {
+                let loadedString: String? = try? await item.load(.stringValue)
+                if let raw = loadedString, let date = parseQuickTimeDate(raw) {
                     return localWallClock(date)
                 }
             }
         }
 
-        if let loadedDate = try? await asset.load(.creationDate), let date = loadedDate?.dateValue {
+        if let loadedItem = try? await asset.load(.creationDate), let date = loadedItem.dateValue {
             return localWallClock(date)
         }
 
