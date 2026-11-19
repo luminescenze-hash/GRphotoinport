@@ -26,14 +26,8 @@ try {
     $g.FillRectangle($bgBrush, $rect)
     $bgBrush.Dispose()
 
-    # Faint concentric lens rings
-    $ringPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 48, 48, 48), 14)
-    $g.DrawEllipse($ringPen, 168, 168, 688, 688)
-    $ringPen.Dispose()
-
-    $innerRingPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 27, 27, 27), 8)
-    $g.DrawEllipse($innerRingPen, 216, 216, 592, 592)
-    $innerRingPen.Dispose()
+    # 图标不再绘制同心圆环（用户要求去掉圆圈）：
+    # 保持纯黑渐变底 + GR 字标 + 红色横条，无任何圆形元素。
 
     # GR wordmark
     $fonts = (New-Object System.Drawing.Text.InstalledFontCollection).Families | ForEach-Object { $_.Name }

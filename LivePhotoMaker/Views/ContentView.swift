@@ -111,14 +111,14 @@ struct ContentView: View {
             Button {
                 presentRootPicker()
             } label: {
-                Label("一键选择 U 盘（自动识别 GRLIFE 与 DCIM/100RICOH）", systemImage: "wand.and.stars")
+                Label("一键导入 U 盘（先选 MOV，再选 JPG）", systemImage: "wand.and.stars")
                     .font(.footnote.weight(.semibold))
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .disabled(model.isImporting)
 
-            Text("只选一次 U 盘根目录，App 自动在根目录下取 GRLIFE 的 MOV 和 DCIM/100RICOH 的同名 JPG。")
+            Text("外接 U 盘不支持“原地打开”，选文件夹会整片灰显。这里改为让系统把文件拷贝进 App：先多选 GRLIFE 里的 MOV，选完自动接着弹 JPG 选择（DCIM/100RICOH），随后自动配对。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -164,10 +164,26 @@ struct ContentView: View {
     private func presentRootPicker() {
         guard !model.isImporting else { return }
 
-        DocumentPickerPresenter.shared.presentFolderPicker(access: .inPlace) { urls in
-            guard let url = urls?.first else { return }
+        // 外接 U 盘在系统文件提供者上不支持「原地打开」，选文件夹会整片灰显。
+        // 因此一键流程不再去选根目录，而是直接用 copy 方式选文件：
+        // 先多选 GRLIFE 里的 MOV，选完自动接着多选 DCIM/100RICOH 里的 JPG，
+        // 两份副本都落到沙盒 Imported/ 下后自动配对扫描。
+        DocumentPickerPresenter.shared.presentMoviePicker(access: .copy) { movieURLs in
+            guard let movieURLs, !movieURLs.isEmpty else { return }
+
             Task { @MainActor in
-                model.setRootFolder(url)
+                model.importCopiedItems(movieURLs, role: .movies)
+            }
+
+            Task { @MainActor in
+                // 等上一个选择器完全收起，避免 present 冲突。
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                DocumentPickerPresenter.shared.presentImagePicker(access: .copy) { photoURLs in
+                    guard let photoURLs, !photoURLs.isEmpty else { return }
+                    Task { @MainActor in
+                        _ = model.importCopiedItems(photoURLs, role: .photos)
+                    }
+                }
             }
         }
     }
