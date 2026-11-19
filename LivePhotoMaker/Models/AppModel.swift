@@ -81,6 +81,122 @@ final class AppModel {
         scan()
     }
 
+    // MARK: - 一键识别 U 盘结构
+
+    /// 选择 U 盘根目录（或 GRLIFE / DCIM / 100RICOH 任意一层）后自动推导：
+    /// - MOV 目录：`<根>/GRLIFE`
+    /// - JPG 目录：`<根>/DCIM/100RICOH`，不存在则退回 `DCIM`，再退回所选目录本身。
+    func setRootFolder(_ url: URL) {
+        guard !isImporting else { return }
+
+        let fileManager = FileManager.default
+        func isDirectory(_ candidate: URL) -> Bool {
+            var isDir = ObjCBool(false)
+            return fileManager.fileExists(atPath: candidate.path, isDirectory: &isDir) && isDir.boolValue
+        }
+
+        let name = url.lastPathComponent.uppercased()
+        var movieBase = url
+        var photoBase = url
+
+        if name == "GRLIFE" {
+            movieBase = url
+            photoBase = url.deletingLastPathComponent()
+        } else if name == "DCIM" {
+            movieBase = url.deletingLastPathComponent()
+            photoBase = url
+        } else if name.hasPrefix("100RICOH") || name.hasPrefix("101RICOH") {
+            movieBase = url.deletingLastPathComponent().deletingLastPathComponent()
+            photoBase = url.deletingLastPathComponent()
+        }
+
+        let movies = [movieBase.appendingPathComponent("GRLIFE", isDirectory: true), movieBase]
+            .first(where: isDirectory) ?? movieBase
+
+        let photos = [
+            photoBase.appendingPathComponent("DCIM", isDirectory: true)
+                .appendingPathComponent("100RICOH", isDirectory: true),
+            photoBase.appendingPathComponent("DCIM", isDirectory: true),
+            photoBase.appendingPathComponent("100RICOH", isDirectory: true),
+            photoBase
+        ].first(where: isDirectory) ?? photoBase
+
+        applyFolders(movieURL: movies, photoURL: photos)
+    }
+
+    private func applyFolders(movieURL: URL, photoURL: URL) {
+        let movieRef = FolderRef(url: movieURL)
+        let photoRef = FolderRef(url: photoURL)
+        movieFolder = movieRef
+        photoFolder = photoRef
+
+        if let bookmark = movieRef.makeBookmark() {
+            defaults.set(bookmark, forKey: Keys.movieBookmark)
+        }
+        if let bookmark = photoRef.makeBookmark() {
+            defaults.set(bookmark, forKey: Keys.photoBookmark)
+        }
+
+        scan()
+    }
+
+    /// 外接 U 盘在系统文件提供者上不支持原地打开，选择器会整片灰显。
+    /// 此时改用 `asCopy: true` 让系统把选中内容复制进 App，再处理这份副本。
+    /// - Parameters:
+    ///   - urls: 选择器回调的沙盒内 URL（文件或文件夹）。
+    ///   - role: 目标角色，`.movies` 落到 `Imported/GRLIFE`，`.photos` 落到 `Imported/DCIM`。
+    @discardableResult
+    func importCopiedItems(_ urls: [URL], role: FolderRole) -> Bool {
+        guard !isImporting, !urls.isEmpty else { return false }
+
+        let fileManager = FileManager.default
+        guard let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return false
+        }
+
+        let root = documents.appendingPathComponent("Imported", isDirectory: true)
+        let movieDir = root.appendingPathComponent("GRLIFE", isDirectory: true)
+        let photoDir = root.appendingPathComponent("DCIM", isDirectory: true)
+        let dest = role == .movies ? movieDir : photoDir
+
+        do {
+            try fileManager.createDirectory(at: movieDir, withIntermediateDirectories: true)
+            try fileManager.createDirectory(at: photoDir, withIntermediateDirectories: true)
+
+            // 只清空本次导入角色的目录，保留另一侧的副本，避免必须两步同时完成。
+            for item in (try? fileManager.contentsOfDirectory(at: dest, includingPropertiesForKeys: nil)) ?? [] {
+                try? fileManager.removeItem(at: item)
+            }
+
+            for source in urls {
+                var isDir = ObjCBool(false)
+                guard fileManager.fileExists(atPath: source.path, isDirectory: &isDir) else { continue }
+                let name = source.lastPathComponent.isEmpty ? "copied" : source.lastPathComponent
+
+                var target = dest.appendingPathComponent(name)
+                var index = 1
+                while fileManager.fileExists(atPath: target.path) {
+                    let stem = (name as NSString).deletingPathExtension
+                    let ext = (name as NSString).pathExtension
+                    let uniquified = ext.isEmpty ? "\(stem)-\(index)" : "\(stem)-\(index).\(ext)"
+                    target = dest.appendingPathComponent(uniquified)
+                    index += 1
+                }
+
+                // 选择器 asCopy 的产物落在 App 沙盒 Inbox 里，能 move 就 move，避免磁盘多一份。
+                if (try? fileManager.moveItem(at: source, to: target)) == nil {
+                    try fileManager.copyItem(at: source, to: target)
+                }
+            }
+        } catch {
+            scanError = "拷贝文件失败：\(error.localizedDescription)"
+            return false
+        }
+
+        applyFolders(movieURL: movieDir, photoURL: photoDir)
+        return true
+    }
+
     /// 备用方案：读取 App 自己 Documents 下的 GRLIFE / DCIM。
     /// 用户可以先在“文件”App 里把 U 盘的这两个文件夹复制到
     /// “我的 iPhone → GRliveinport”目录，从而绕开外接卷选择器的兼容性问题。

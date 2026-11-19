@@ -72,7 +72,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("GRliveinport · 把 U 盘里的照片和视频合成实况照片")
                     .font(.subheadline.weight(.semibold))
-                Text("从 GRLIFE 中读取 MOV，从 DCIM 中读取同名 JPG，合成后保存到系统相册。文件名忽略大小写，DCIM 的子文件夹会被递归查找。")
+                Text("从外接 U 盘（RICOH GR）根目录的 GRLIFE 读取 MOV，再从同盘 DCIM/100RICOH 读取同名 JPG，合成实况照片后写入 iPhone 系统相册。文件名忽略大小写，子目录递归查找。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -86,34 +86,118 @@ struct ContentView: View {
 
     private var folderCards: some View {
         VStack(spacing: 12) {
-            FolderCardView(
+            autoDetectCard
+
+            folderCard(
                 title: "GRLIFE 文件夹（MOV）",
-                subtitle: "进入 U 盘后选择 GRLIFE，再点右上角“打开”",
+                subtitle: "U 盘根目录 / GRLIFE，里面是 .MOV 视频",
                 systemImage: "film",
                 folder: model.movieFolder,
-                selectTitle: "选择文件夹",
-                action: { presentPicker(for: .movies) }
+                role: .movies
             )
 
-            FolderCardView(
-                title: "DCIM 文件夹（JPG）",
-                subtitle: "进入 U 盘后选择 DCIM，再点右上角“打开”",
+            folderCard(
+                title: "DCIM/100RICOH 文件夹（JPG）",
+                subtitle: "U 盘根目录 / DCIM/100RICOH，里面是同名 .JPG",
                 systemImage: "photo.on.rectangle.angled",
                 folder: model.photoFolder,
-                selectTitle: "选择文件夹",
-                action: { presentPicker(for: .photos) }
+                role: .photos
             )
+        }
+    }
+
+    private var autoDetectCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                presentRootPicker()
+            } label: {
+                Label("一键选择 U 盘（自动识别 GRLIFE 与 DCIM/100RICOH）", systemImage: "wand.and.stars")
+                    .font(.footnote.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(model.isImporting)
+
+            Text("只选一次 U 盘根目录，App 自动在根目录下取 GRLIFE 的 MOV 和 DCIM/100RICOH 的同名 JPG。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func folderCard(
+        title: String,
+        subtitle: String,
+        systemImage: String,
+        folder: FolderRef?,
+        role: FolderRole
+    ) -> some View {
+        VStack(spacing: 8) {
+            FolderCardView(
+                title: title,
+                subtitle: subtitle,
+                systemImage: systemImage,
+                folder: folder,
+                selectTitle: "选择文件夹",
+                action: { presentPicker(for: role) }
+            )
+
+            Button {
+                presentCopyImport(for: role)
+            } label: {
+                Label(
+                    role == .movies
+                        ? "拷贝导入 MOV 文件（文件夹点不动时用）"
+                        : "拷贝导入 JPG 文件（文件夹点不动时用）",
+                    systemImage: "square.and.arrow.down"
+                )
+                .font(.caption)
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(model.isImporting)
+        }
+    }
+
+    private func presentRootPicker() {
+        guard !model.isImporting else { return }
+
+        DocumentPickerPresenter.shared.presentFolderPicker(access: .inPlace) { urls in
+            guard let url = urls?.first else { return }
+            Task { @MainActor in
+                model.setRootFolder(url)
+            }
         }
     }
 
     private func presentPicker(for role: FolderRole) {
         guard !model.isImporting else { return }
 
-        DocumentPickerPresenter.shared.presentFolderPicker { url in
-            guard let url else { return }
+        DocumentPickerPresenter.shared.presentFolderPicker(access: .inPlace) { urls in
+            guard let url = urls?.first else { return }
             Task { @MainActor in
                 model.setFolder(url, role: role)
             }
+        }
+    }
+
+    private func presentCopyImport(for role: FolderRole) {
+        guard !model.isImporting else { return }
+
+        let handle: ([URL]?) -> Void = { urls in
+            guard let urls, !urls.isEmpty else { return }
+            Task { @MainActor in
+                _ = model.importCopiedItems(urls, role: role)
+            }
+        }
+
+        switch role {
+        case .movies:
+            DocumentPickerPresenter.shared.presentMoviePicker(access: .copy, completion: handle)
+        case .photos:
+            DocumentPickerPresenter.shared.presentImagePicker(access: .copy, completion: handle)
         }
     }
 
@@ -122,10 +206,10 @@ struct ContentView: View {
     /// 用户可以把 GRLIFE/DCIM 复制进 App 的 Documents（Files 里显示为 GRliveinport）再导入。
     private var folderHelpCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label("选择文件夹提示", systemImage: "info.circle")
+            Label("选择器提示", systemImage: "info.circle")
                 .font(.footnote.weight(.semibold))
 
-            Text("在系统文件选择器中：进入 U 盘 → 点进 GRLIFE / DCIM 文件夹 → 点右上角“打开”。只单击文件夹只会进入下一层，不会选中。")
+            Text("外接 U 盘若不支持“原地打开”，系统选择器里的文件夹会整体灰显、点不动。这时用各卡片下方的“拷贝导入”，直接多选 GRLIFE 里的 MOV 和 DCIM/100RICOH 里的 JPG，系统先复制进 App 再合成。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
