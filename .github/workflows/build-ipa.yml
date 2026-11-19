@@ -15,7 +15,9 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-15
+    # macOS arm64 标准 runner 高峰排队严重（常排队 15 分钟后被取消），
+    # 改用 x64 镜像，容量更宽松。
+    runs-on: macos-15-intel
     timeout-minutes: 45
 
     steps:
