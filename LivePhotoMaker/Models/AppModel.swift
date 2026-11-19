@@ -279,7 +279,7 @@ final class AppModel {
         scanTask = Task { [weak self] in
             do {
                 let outcome = try await Task.detached(priority: .userInitiated) {
-                    try MediaScanner.scan(moviesRoot: moviesRoot, photosRoot: photosRoot)
+                    try await MediaScanner.scan(moviesRoot: moviesRoot, photosRoot: photosRoot)
                 }.value
 
                 guard let self, !Task.isCancelled else { return }

@@ -21,6 +21,20 @@ struct PairRowView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
+                if let time = pair.movie.captureTime ?? pair.photo.captureTime {
+                    Text(Self.captureFormatter.string(from: time))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+
+                if pair.movie.stem.lowercased() != pair.photo.stem.lowercased() {
+                    Text("按时间配对：JPG \(pair.photo.name)")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
                 statusView
             }
 
@@ -87,6 +101,13 @@ struct PairRowView: View {
             .padding(.vertical, 2)
             .background(color.opacity(0.12), in: Capsule())
     }
+
+    private static let captureFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter
+    }()
 
     private func format(_ bytes: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)

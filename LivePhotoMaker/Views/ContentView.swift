@@ -72,7 +72,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("GRliveinport · 把 U 盘里的照片和视频合成实况照片")
                     .font(.subheadline.weight(.semibold))
-                Text("从外接 U 盘（RICOH GR）根目录的 GRLIFE 读取 MOV，再从同盘 DCIM/100RICOH 读取同名 JPG，合成实况照片后写入 iPhone 系统相册。文件名忽略大小写，子目录递归查找。")
+                Text("从外接 U 盘（RICOH GR）根目录的 GRLIFE 读取 MOV，再从同盘 DCIM/100RICOH 读取 JPG，按拍摄时间配对后合成实况照片写入 iPhone 系统相册。时间读不到时退回按文件名配对，子目录递归查找。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -98,7 +98,7 @@ struct ContentView: View {
 
             folderCard(
                 title: "DCIM/100RICOH 文件夹（JPG）",
-                subtitle: "U 盘根目录 / DCIM/100RICOH，里面是同名 .JPG",
+                subtitle: "U 盘根目录 / DCIM/100RICOH，里面是 .JPG 照片",
                 systemImage: "photo.on.rectangle.angled",
                 folder: model.photoFolder,
                 role: .photos
@@ -332,7 +332,7 @@ struct ContentView: View {
             }
 
             if model.pairs.isEmpty {
-                Text("没有找到同名的 MOV 与 JPG。配对依据是去掉扩展名后的文件名，例如 IMG_0001.MOV ↔ IMG_0001.JPG。")
+                Text("没有找到能配对的 MOV 与 JPG。配对依据是拍摄时间（相差 8 秒内视为同一次拍摄）；两边时间都读不到时，才退回按去掉扩展名后的同名文件匹配。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -432,7 +432,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("有未匹配的文件")
                     .font(.footnote.weight(.medium))
-                Text("\(model.unmatchedMovies.count) 个 MOV、\(model.unmatchedPhotos.count) 个 JPG 找不到同名对象")
+                Text("\(model.unmatchedMovies.count) 个 MOV、\(model.unmatchedPhotos.count) 个 JPG 找不到时间相近的对象")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -608,9 +608,9 @@ private struct UnmatchedListView: View {
                         }
                     }
                 } header: {
-                    Text("没有同名 JPG 的 MOV（\(movies.count)）")
+                    Text("没有可配对 JPG 的 MOV（\(movies.count)）")
                 } footer: {
-                    Text("这些 MOV 在 DCIM 中找不到去掉扩展名后同名的 JPG。")
+                    Text("这些 MOV 在 DCIM 中找不到拍摄时间相近的 JPG，也没有同名文件可配。")
                 }
 
                 Section {
@@ -623,9 +623,9 @@ private struct UnmatchedListView: View {
                         }
                     }
                 } header: {
-                    Text("没有同名 MOV 的 JPG（\(photos.count)）")
+                    Text("没有可配对 MOV 的 JPG（\(photos.count)）")
                 } footer: {
-                    Text("这些 JPG 在 GRLIFE 中找不到去掉扩展名后同名的 MOV。")
+                    Text("这些 JPG 在 GRLIFE 中找不到拍摄时间相近的 MOV，也没有同名文件可配。")
                 }
             }
             .navigationTitle("未匹配文件")
