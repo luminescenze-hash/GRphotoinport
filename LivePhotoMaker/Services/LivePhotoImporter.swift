@@ -51,7 +51,7 @@ struct LivePhotoImporter {
         let pairedMovieURL = workDir.appendingPathComponent("paired.mov", isDirectory: false)
 
         try writeStillImage(from: photoURL, to: stillURL, assetIdentifier: assetIdentifier)
-        try await writePairedMovie(from: movieURL, to: pairedMovieURL, assetIdentifier: assetIdentifier)
+        try await writePairedMovie(from: movieURL, to: pairedMovieURL, assetIdentifier: assetIdentifier, photoURL: photoURL)
         try await writeToLibrary(photoURL: stillURL, movieURL: pairedMovieURL)
     }
 
@@ -137,8 +137,48 @@ struct LivePhotoImporter {
 
     // MARK: - MOV：重封装并写入 Live Photo 元数据
 
-    private func writePairedMovie(from sourceURL: URL, to destinationURL: URL, assetIdentifier: String) async throws {
-        let asset = AVURLAsset(url: sourceURL)
+    /// 写 MOV。`shouldBakeRotation` 为 false 时用轨道矩阵声明方向（无损直传）；
+    /// 为 true 时先把旋转烘焙进像素，再直传封装元数据（兜底路径）。
+    private func writePairedMovie(
+        from sourceURL: URL,
+        to destinationURL: URL,
+        assetIdentifier: String,
+        photoURL: URL,
+        shouldBakeRotation: Bool = false
+    ) async throws {
+        // 相机竖拍时 JPG 只靠 EXIF 方向标记，而 MOV 的画面往往是横向像素且没有方向信息；
+        // 原样成对写入相册就会出现「静止图竖、视频横」。这里让视频显示方向跟随照片。
+        let stillOrientation = stillImageOrientation(at: photoURL)
+
+        var effectiveSourceURL = sourceURL
+        if shouldBakeRotation {
+            let bakedURL = destinationURL
+                .deletingLastPathComponent()
+                .appendingPathComponent("baked.mov", isDirectory: false)
+            try? FileManager.default.removeItem(at: bakedURL)
+
+            let probe = AVURLAsset(url: sourceURL)
+            guard let probeTrack = (try? await probe.loadTracks(withMediaType: .video))?.first else {
+                throw LivePhotoImportError.videoProcessingFailed(reason: "MOV 中没有视频轨道")
+            }
+            let probeTransform = (try? await probeTrack.load(.preferredTransform)) ?? .identity
+            let probeSize = (try? await probeTrack.load(.naturalSize)) ?? CGSize(width: 1, height: 1)
+            let targetTransform = adjustedVideoTransform(
+                source: probeTransform,
+                naturalSize: probeSize,
+                photoOrientation: stillOrientation
+            )
+            try await bakeRotationIntoVideo(
+                sourceURL: sourceURL,
+                destinationURL: bakedURL,
+                videoTrack: probeTrack,
+                transform: targetTransform,
+                naturalSize: probeSize
+            )
+            effectiveSourceURL = bakedURL
+        }
+
+        let asset = AVURLAsset(url: effectiveSourceURL)
 
         let videoTracks: [AVAssetTrack]
         let audioTracks: [AVAssetTrack]
@@ -159,9 +199,11 @@ struct LivePhotoImporter {
 
         let videoFormatDescriptions: [CMFormatDescription]
         let videoTransform: CGAffineTransform
+        let naturalSize: CGSize
         do {
             videoFormatDescriptions = try await videoTrack.load(.formatDescriptions)
             videoTransform = try await videoTrack.load(.preferredTransform)
+            naturalSize = try await videoTrack.load(.naturalSize)
         } catch {
             throw LivePhotoImportError.videoProcessingFailed(
                 reason: "无法读取视频信息：\(error.localizedDescription)"
@@ -188,7 +230,15 @@ struct LivePhotoImporter {
             sourceFormatHint: videoFormatDescription
         )
         videoInput.expectsMediaDataInRealTime = false
-        videoInput.transform = videoTransform
+        // 烘焙路径的画面像素已经转到位，矩阵必须是单位阵，否则会二次旋转。
+        let appliedTransform = shouldBakeRotation
+            ? CGAffineTransform.identity
+            : adjustedVideoTransform(
+                source: videoTransform,
+                naturalSize: naturalSize,
+                photoOrientation: stillOrientation
+            )
+        videoInput.transform = appliedTransform
         guard writer.canAdd(videoInput) else {
             throw LivePhotoImportError.videoProcessingFailed(reason: "无法添加视频轨道")
         }
@@ -346,6 +396,22 @@ struct LivePhotoImporter {
                 reason: writer.error?.localizedDescription ?? "视频处理未完成"
             )
         }
+
+        // 直传模式下个别系统版本可能不写轨道矩阵，读回确认一次；
+        // 方向没生效就把旋转烘焙进像素后重写（只重试一次）。
+        if !shouldBakeRotation {
+            let matches = await videoTransformMatches(at: destinationURL, expected: appliedTransform)
+            if !matches {
+                try? FileManager.default.removeItem(at: destinationURL)
+                try await writePairedMovie(
+                    from: sourceURL,
+                    to: destinationURL,
+                    assetIdentifier: assetIdentifier,
+                    photoURL: photoURL,
+                    shouldBakeRotation: true
+                )
+            }
+        }
     }
 
     /// 同时从视频/音频轨道读取并写入，避免一次把整段视频读进内存。
@@ -462,6 +528,127 @@ struct LivePhotoImporter {
             writer.finishWriting {
                 continuation.resume(returning: ())
             }
+        }
+    }
+
+    // MARK: - 方向修正
+
+    private static let transformEpsilon: CGFloat = 0.01
+
+    /// 读静止图的 EXIF 方向（1 正常 / 3 旋转 180° / 6 顺时针 90° / 8 逆时针 90°）。
+    private func stillImageOrientation(at url: URL) -> Int {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [AnyHashable: Any],
+              let value = properties[kCGImagePropertyOrientation as String] as? NSNumber
+        else {
+            return 1
+        }
+        return value.intValue
+    }
+
+    /// 源视频自带方向（矩阵非单位阵）时保留原样，否则按照片的 EXIF 方向补旋转。
+    private func adjustedVideoTransform(
+        source: CGAffineTransform,
+        naturalSize: CGSize,
+        photoOrientation: Int
+    ) -> CGAffineTransform {
+        let epsilon = Self.transformEpsilon
+        let isSourceIdentity = abs(source.a - 1) < epsilon
+            && abs(source.d - 1) < epsilon
+            && abs(source.b) < epsilon
+            && abs(source.c) < epsilon
+        guard isSourceIdentity else { return source }
+        return rotationTransform(for: photoOrientation, naturalSize: naturalSize)
+    }
+
+    /// EXIF 方向 → 让「横向像素」画面呈现为照片视觉方向所需的旋转矩阵。
+    private func rotationTransform(for orientation: Int, naturalSize: CGSize) -> CGAffineTransform {
+        let width = abs(naturalSize.width)
+        let height = abs(naturalSize.height)
+        switch orientation {
+        case 3:
+            return CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: width, ty: height)
+        case 6:
+            return CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: height, ty: 0)
+        case 8:
+            return CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: width)
+        default:
+            return .identity
+        }
+    }
+
+    /// 旋转后的显示尺寸（仅处理 0/90/180/270 四种正交情形）。
+    private func rotatedSize(naturalSize: CGSize, transform: CGAffineTransform) -> CGSize {
+        let width = abs(naturalSize.width)
+        let height = abs(naturalSize.height)
+        if abs(transform.b) > 0.5 || abs(transform.c) > 0.5 {
+            return CGSize(width: height, height: width)
+        }
+        return CGSize(width: width, height: height)
+    }
+
+    /// 读回成品，确认轨道方向矩阵确实写进去了。
+    private func videoTransformMatches(at url: URL, expected: CGAffineTransform) async -> Bool {
+        let asset = AVURLAsset(url: url)
+        guard let tracks = try? await asset.loadTracks(withMediaType: .video),
+              let track = tracks.first,
+              let actual = try? await track.load(.preferredTransform)
+        else {
+            return false
+        }
+        let epsilon = Self.transformEpsilon
+        return abs(actual.a - expected.a) < epsilon
+            && abs(actual.b - expected.b) < epsilon
+            && abs(actual.c - expected.c) < epsilon
+            && abs(actual.d - expected.d) < epsilon
+    }
+
+    /// 兜底：用 video composition 把旋转烘焙进像素，输出方向已正确的中间 MOV。
+    private func bakeRotationIntoVideo(
+        sourceURL: URL,
+        destinationURL: URL,
+        videoTrack: AVAssetTrack,
+        transform: CGAffineTransform,
+        naturalSize: CGSize
+    ) async throws {
+        let asset = AVURLAsset(url: sourceURL)
+        guard let exportSession = AVAssetExportSession(
+            asset: asset,
+            presetName: AVAssetExportPresetHighestQuality
+        ) else {
+            throw LivePhotoImportError.videoProcessingFailed(reason: "无法创建视频导出会话")
+        }
+
+        let duration = (try? await asset.load(.duration)) ?? .zero
+        let frameRate = Double((try? await videoTrack.load(.nominalFrameRate)) ?? 30)
+        let fps = frameRate > 1 ? frameRate : 30
+
+        let composition = AVMutableVideoComposition()
+        composition.renderSize = rotatedSize(naturalSize: naturalSize, transform: transform)
+        composition.frameDuration = CMTime(seconds: 1.0 / fps, preferredTimescale: 600)
+
+        let instruction = AVMutableVideoCompositionInstruction()
+        instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
+        let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
+        layerInstruction.setTransform(transform, at: .zero)
+        instruction.layerInstructions = [layerInstruction]
+        composition.instructions = [instruction]
+
+        exportSession.videoComposition = composition
+        exportSession.outputURL = destinationURL
+        exportSession.outputFileType = .mov
+        exportSession.shouldOptimizeForNetworkUse = false
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            exportSession.exportAsynchronously {
+                continuation.resume(returning: ())
+            }
+        }
+
+        guard exportSession.status == .completed else {
+            throw LivePhotoImportError.videoProcessingFailed(
+                reason: exportSession.error?.localizedDescription ?? "旋转视频失败"
+            )
         }
     }
 
