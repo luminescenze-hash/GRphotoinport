@@ -34,12 +34,57 @@ enum MediaScanner {
     /// 再叠加拷贝过程可能带来的偏移，这里留 8 秒余量。
     static let timeTolerance: TimeInterval = 8
 
-    /// 时间配对候选：一对「视频-照片」的时间差。
+    /// 一组「文件索引 + 该文件所有可能的时间解释」，用于按时间配对。
+    private typealias TimedFile = (index: Int, times: [Date])
+
+    /// 时间配对的候选：一对「视频-照片」的时间差。
     private struct TimeCandidate {
         let delta: TimeInterval
-        let movieIndex: Int
-        let photoIndex: Int
-        let sameStem: Bool
+        let movie: Int
+        let photo: Int
+    }
+
+    /// 在一批「视频时间」与「照片时间」之间做一对一配对：
+    /// 每个文件可带多个时间解释，任一解释落在容差内即成为候选，取最小差值参与排序；
+    /// 时间差最小优先，差值相同按电影索引、照片索引稳定排序，保证结果可复现。
+    private static func timeMatches(movieTimes: [TimedFile], photoTimes: [TimedFile]) -> [(movie: Int, photo: Int)] {
+        var candidates: [TimeCandidate] = []
+
+        for movie in movieTimes {
+            for photo in photoTimes {
+                var best: TimeInterval?
+                for movieTime in movie.times {
+                    for photoTime in photo.times {
+                        let delta = abs(movieTime.timeIntervalSince(photoTime))
+                        guard delta <= timeTolerance else { continue }
+                        if best == nil || delta < (best ?? .greatestFiniteMagnitude) {
+                            best = delta
+                        }
+                    }
+                }
+                guard let delta = best else { continue }
+                candidates.append(TimeCandidate(delta: delta, movie: movie.index, photo: photo.index))
+            }
+        }
+
+        candidates.sort { lhs, rhs in
+            if lhs.delta != rhs.delta { return lhs.delta < rhs.delta }
+            if lhs.movie != rhs.movie { return lhs.movie < rhs.movie }
+            return lhs.photo < rhs.photo
+        }
+
+        var usedMovies = Set<Int>()
+        var usedPhotos = Set<Int>()
+        var matches: [(movie: Int, photo: Int)] = []
+
+        for candidate in candidates {
+            if usedMovies.contains(candidate.movie) || usedPhotos.contains(candidate.photo) { continue }
+            usedMovies.insert(candidate.movie)
+            usedPhotos.insert(candidate.photo)
+            matches.append((candidate.movie, candidate.photo))
+        }
+
+        return matches
     }
 
     /// U 盘上常见的系统目录，直接跳过。
@@ -92,59 +137,24 @@ enum MediaScanner {
 
         // MARK: 第一步：按拍摄时间配对
 
-        // 只有两边都拿到了拍摄时间的文件才参与；其余进入下一步按文件名兜底，
-        // 避免「一个有时间、一个没时间」时产生错配。
-        let timedMovies = candidateMovies.enumerated().filter { $0.element.captureTime != nil }
-        let timedPhotoIndices = candidatePhotos.enumerated()
-            .filter { $0.element.captureTime != nil }
-            .sorted { ($0.element.captureTime ?? .distantPast) < ($1.element.captureTime ?? .distantPast) }
-        let photoTimes = timedPhotoIndices.map { $0.element.captureTime ?? .distantPast }
-
-        var candidates: [TimeCandidate] = []
-        for (movieIndex, movie) in timedMovies {
-            guard let movieTime = movie.captureTime else { continue }
-            let lower = movieTime.addingTimeInterval(-timeTolerance)
-            let upper = movieTime.addingTimeInterval(timeTolerance)
-
-            var position = firstIndex(of: lower, in: photoTimes)
-            while position < photoTimes.count, photoTimes[position] <= upper {
-                let photoEntry = timedPhotoIndices[position]
-                let photo = photoEntry.element
-                if let photoTime = photo.captureTime {
-                    candidates.append(TimeCandidate(
-                        delta: abs(movieTime.timeIntervalSince(photoTime)),
-                        movieIndex: movieIndex,
-                        photoIndex: photoEntry.offset,
-                        sameStem: movie.stem.lowercased() == photo.stem.lowercased()
-                    ))
-                }
-                position += 1
-            }
-        }
-
-        // 时间差最小优先；时间差相同时同名优先，再按文件名稳定排序，保证结果可复现。
-        candidates.sort { lhs, rhs in
-            if lhs.delta != rhs.delta { return lhs.delta < rhs.delta }
-            if lhs.sameStem != rhs.sameStem { return lhs.sameStem && !rhs.sameStem }
-            let lName = candidateMovies[lhs.movieIndex].name
-            let rName = candidateMovies[rhs.movieIndex].name
-            if lName != rName { return lName.localizedStandardCompare(rName) == .orderedAscending }
-            return candidatePhotos[lhs.photoIndex].name.localizedStandardCompare(candidatePhotos[rhs.photoIndex].name) == .orderedAscending
-        }
+        // 只有真正读到元数据时间的文件才参与时间配对；读不到的留到下一步按文件名兜底，
+        // 避免「拷贝时间恰好相近」这类伪时间造成错配。
+        let metadataMovieTimes = candidateMovies.enumerated()
+            .filter { !$0.element.pairingTimes.isEmpty }
+            .map { (index: $0.offset, times: $0.element.pairingTimes) }
+        let metadataPhotoTimes = candidatePhotos.enumerated()
+            .filter { !$0.element.pairingTimes.isEmpty }
+            .map { (index: $0.offset, times: $0.element.pairingTimes) }
 
         var usedMovies = Set<Int>()
         var usedPhotos = Set<Int>()
 
-        for candidate in candidates {
-            if usedMovies.contains(candidate.movieIndex) { continue }
-            if usedPhotos.contains(candidate.photoIndex) { continue }
-
-            usedMovies.insert(candidate.movieIndex)
-            usedPhotos.insert(candidate.photoIndex)
-
-            let movie = candidateMovies[candidate.movieIndex]
-            let photo = candidatePhotos[candidate.photoIndex]
-            pairs.append(MediaPair(stem: movie.stem, movie: movie, photo: photo))
+        for match in timeMatches(movieTimes: metadataMovieTimes, photoTimes: metadataPhotoTimes) {
+            usedMovies.insert(match.movie)
+            usedPhotos.insert(match.photo)
+            pairs.append(MediaPair(stem: candidateMovies[match.movie].stem,
+                                   movie: candidateMovies[match.movie],
+                                   photo: candidatePhotos[match.photo]))
             timeMatchedCount += 1
         }
 
@@ -203,8 +213,12 @@ enum MediaScanner {
         var result: [FoundFile] = []
         result.reserveCapacity(files.count)
         for file in files {
-            let time = await videoCaptureTime(file.url) ?? file.captureTime
-            result.append(file.withCaptureTime(time))
+            let times = await videoCaptureTimes(file.url)
+            if times.isEmpty {
+                result.append(file)
+            } else {
+                result.append(file.withCaptureTimes(primary: times.first, candidates: times))
+            }
         }
         return result
     }
@@ -212,12 +226,14 @@ enum MediaScanner {
     /// 图片直接同步读 EXIF，成本很低（只读文件头），不需要异步。
     private static func attachingPhotoCaptureTimes(_ files: [FoundFile]) -> [FoundFile] {
         files.map { file in
-            file.withCaptureTime(photoCaptureTime(file.url) ?? file.captureTime)
+            let times = photoCaptureTimes(file.url)
+            if times.isEmpty { return file }
+            return file.withCaptureTimes(primary: times.first, candidates: times)
         }
     }
 
-    /// 视频拍摄时间：优先 QuickTime 的 creationdate 元数据，其次 AVAsset.creationDate。
-    private static func videoCaptureTime(_ url: URL) async -> Date? {
+    /// 视频拍摄时间的全部可能解释：优先 QuickTime 的 creationdate 元数据，其次 AVAsset.creationDate。
+    private static func videoCaptureTimes(_ url: URL) async -> [Date] {
         let asset = AVURLAsset(url: url)
 
         if let items = try? await asset.load(.metadata) {
@@ -228,25 +244,38 @@ enum MediaScanner {
                     || rawKey.contains("creationdate") || rawKey.contains("creation_date")
                 guard matched else { continue }
 
-                let loadedDate: Date? = try? await item.load(.dateValue)
-                if let date = loadedDate {
-                    return localWallClock(date)
-                }
+                // 带时区的字面量（如 2026-11-19T16:11:07+0800）按本地挂钟解释优先。
                 let loadedString: String? = try? await item.load(.stringValue)
                 if let raw = loadedString, let date = parseQuickTimeDate(raw) {
-                    return localWallClock(date)
+                    let interpretations = timeInterpretations(of: date, preferUTC: false)
+                    if !interpretations.isEmpty { return interpretations }
+                }
+
+                let loadedDate: Date? = try? await item.load(.dateValue)
+                if let date = loadedDate {
+                    let interpretations = timeInterpretations(of: date, preferUTC: false)
+                    if !interpretations.isEmpty { return interpretations }
                 }
             }
         }
 
         if let loadedItem = try? await asset.load(.creationDate), let date = loadedItem.dateValue {
-            return localWallClock(date)
+            // 容器头（moov/mvhd）里的 creation date 绝大多数相机写的是
+            // 「拍摄时的本地钟面时间，但按 UTC 记录」，所以 UTC 解释排在最前面。
+            return timeInterpretations(of: date, preferUTC: true)
         }
 
-        return nil
+        return []
     }
 
     /// 图片拍摄时间：EXIF DateTimeOriginal 优先，其次 TIFF DateTime。
+    private static func photoCaptureTimes(_ url: URL) -> [Date] {
+        guard let date = photoCaptureTime(url) else { return [] }
+        // EXIF 时间不带时区，按本地时区解析得到的钟面时间就是相机当时显示的时间，只保留这一种解释。
+        return [date]
+    }
+
+    /// 读取 EXIF/TIFF 里的原始拍摄时间。
     private static func photoCaptureTime(_ url: URL) -> Date? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] else {
@@ -307,18 +336,26 @@ enum MediaScanner {
         return calendar.date(from: components) ?? date
     }
 
-    private static func firstIndex(of value: Date, in sortedDates: [Date]) -> Int {
-        var low = 0
-        var high = sortedDates.count
-        while low < high {
-            let mid = (low + high) / 2
-            if sortedDates[mid] < value {
-                low = mid + 1
-            } else {
-                high = mid
-            }
+    /// 把 UTC 分量当成墙上时间：相机常把「本地钟面时间」直接写进容器并标为 UTC
+    /// （例如 16:11:07 的拍摄在 mvhd 里就是 16:11:07Z），这种解释下要点是丢掉时区换算。
+    private static func utcWallClock(_ date: Date) -> Date {
+        var utcCalendar = Calendar(identifier: .gregorian)
+        utcCalendar.timeZone = TimeZone(secondsFromGMT: 0) ?? TimeZone.current
+        let components = utcCalendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
+        return Calendar.current.date(from: components) ?? date
+    }
+
+    /// 同一个绝对时刻的两种可能解释：
+    /// 1) 按本地时区显示的墙上时间（元数据确实是带时区的真 UTC 时正确）；
+    /// 2) 把 UTC 分量直接当墙上时间（相机把本地时间当 UTC 写进容器时正确）。
+    /// 两种都作为候选参与配对，任一对上即可，避免时区基准不同导致整批都配不上。
+    private static func timeInterpretations(of date: Date, preferUTC: Bool) -> [Date] {
+        let local = localWallClock(date)
+        let utc = utcWallClock(date)
+        if abs(local.timeIntervalSince(utc)) < 1 {
+            return [local]
         }
-        return low
+        return preferUTC ? [utc, local] : [local, utc]
     }
 
     // MARK: - 递归扫描

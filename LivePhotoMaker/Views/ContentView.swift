@@ -332,7 +332,7 @@ struct ContentView: View {
             }
 
             if model.pairs.isEmpty {
-                Text("没有找到能配对的 MOV 与 JPG。配对依据是拍摄时间（相差 8 秒内视为同一次拍摄）；两边时间都读不到时，才退回按去掉扩展名后的同名文件匹配。")
+                Text("没有找到能配对的 MOV 与 JPG。配对依据是拍摄时间（相差 8 秒内视为同一次拍摄，兼容相机把本地时间记录成 UTC 的时区差异）；两边都读不到拍摄时间时，才退回按去掉扩展名后的同名文件匹配。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
